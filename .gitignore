@@ -7,3 +7,10 @@ config.json
 config.yaml
 src/opcodes.rs
 backups/
+*.bat
+*.exe
+*.lnk
+*.dll
+*.pdb
+*.lib
+*.exp

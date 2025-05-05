@@ -201,6 +201,16 @@ impl ChatHandler {
             }
             "!spawnmonster" => {
                 let spawn_index = connection.get_free_spawn_index();
+                
+                let bnpc_id: u32;
+                let model_id: u16;
+                if parts.len() > 2 {
+                    bnpc_id = parts[1].parse::<u32>().unwrap();
+                    model_id = parts[2].parse::<u16>().unwrap();
+                } else {
+                    bnpc_id = 13498;
+                    model_id = 297;
+                }
 
                 // spawn a tiny mandragora
                 {
@@ -215,12 +225,12 @@ impl ChatHandler {
                                 mp_curr: 100,
                                 mp_max: 100,
                                 spawn_index,
-                                bnpc_base: 13498, // TODO: changing this prevents it from spawning...
+                                bnpc_base: bnpc_id, // TODO: changing this prevents it from spawning...
                                 bnpc_name: 405,
                                 object_kind: ObjectKind::BattleNpc(BattleNpcSubKind::Enemy),
                                 level: 1,
                                 battalion: 4,
-                                model_chara: 297,
+                                model_chara: model_id,
                                 pos: connection.player_data.position,
                                 ..Default::default()
                             },

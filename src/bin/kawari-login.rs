@@ -128,9 +128,10 @@ struct RegisterInput {
 }
 
 async fn do_register(
+    jar: CookieJar,
     State(state): State<LoginServerState>,
     Form(input): Form<RegisterInput>,
-) -> Redirect {
+) -> (CookieJar, Redirect) {
     tracing::info!(
         "Registering with {:#?} and {:#?}!",
         input.username,
@@ -146,7 +147,15 @@ async fn do_register(
 
     state.database.add_user(&username, &password);
 
-    Redirect::to("/")
+    // redirect to account management page
+    let sid = state.database.login_user(&username, &password).unwrap();
+
+    let cookie = Cookie::build(("cis_sessid", sid))
+        .path("/")
+        .secure(false)
+        .expires(Expiration::Session)
+        .http_only(true);
+    (jar.add(cookie), Redirect::to("/account/app/svc/manage"))
 }
 
 #[derive(Deserialize)]
@@ -164,15 +173,25 @@ async fn check_session(
 }
 
 async fn login() -> Html<String> {
+    let config = get_config();
     let environment = setup_default_environment();
     let template = environment.get_template("login.html").unwrap();
-    Html(template.render(context! {}).unwrap())
+    Html(
+        template
+            .render(context! { web_server_name => config.web.server_name })
+            .unwrap(),
+    )
 }
 
 async fn register() -> Html<String> {
+    let config = get_config();
     let environment = setup_default_environment();
     let template = environment.get_template("register.html").unwrap();
-    Html(template.render(context! {}).unwrap())
+    Html(
+        template
+            .render(context! { web_server_name => config.web.server_name })
+            .unwrap(),
+    )
 }
 
 #[derive(Deserialize, Debug)]

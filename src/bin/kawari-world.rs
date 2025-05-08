@@ -3,15 +3,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use kawari::RECEIVE_BUFFER_SIZE;
-use kawari::common::workdefinitions::{CharaMake, RemakeMode};
+use kawari::common::Position;
 use kawari::common::{GameData, ObjectId, timestamp_secs};
-use kawari::common::{Position, determine_initial_starting_zone};
 use kawari::config::get_config;
-use kawari::inventory::{Inventory, Item};
+use kawari::inventory::Item;
 use kawari::ipc::chat::{ServerChatIpcData, ServerChatIpcSegment};
-use kawari::ipc::kawari::{CustomIpcData, CustomIpcSegment, CustomIpcType};
 use kawari::ipc::zone::{
-    ActionEffect, ActionResult, ClientZoneIpcData, EffectKind, GameMasterCommandType,
+    ActionEffect, ActionResult, ClientZoneIpcData, EffectKind, EventStart, GameMasterCommandType,
     GameMasterRank, OnlineStatus, ServerZoneIpcData, ServerZoneIpcSegment, SocialListRequestType,
 };
 use kawari::ipc::zone::{
@@ -20,12 +18,11 @@ use kawari::ipc::zone::{
 use kawari::opcodes::{ServerChatIpcType, ServerZoneIpcType};
 use kawari::packet::oodle::OodleNetwork;
 use kawari::packet::{
-    CompressionType, ConnectionType, PacketSegment, PacketState, SegmentData, SegmentType,
-    send_keep_alive, send_packet,
+    ConnectionType, PacketSegment, PacketState, SegmentData, SegmentType, send_keep_alive,
 };
 use kawari::world::{
-    Actor, ClientHandle, EffectsBuilder, FromServer, LuaPlayer, PlayerData, ServerHandle,
-    StatusEffects, ToServer, WorldDatabase, server_main_loop,
+    Actor, ClientHandle, EffectsBuilder, Event, FromServer, LuaPlayer, PlayerData, ServerHandle,
+    StatusEffects, ToServer, WorldDatabase, handle_custom_ipc, server_main_loop,
 };
 use kawari::world::{ChatHandler, Zone, ZoneConnection};
 
@@ -40,6 +37,8 @@ use tokio::task::JoinHandle;
 #[derive(Default)]
 struct ExtraLuaState {
     action_scripts: HashMap<u32, String>,
+    event_scripts: HashMap<u32, String>,
+    command_scripts: HashMap<String, String>,
 }
 
 fn spawn_main_loop() -> (ServerHandle, JoinHandle<()>) {
@@ -137,9 +136,6 @@ async fn client_loop(
     let lua = connection.lua.clone();
     let config = get_config();
 
-    let mut exit_position = None;
-    let mut exit_rotation = None;
-
     let mut lua_player = LuaPlayer::default();
 
     let mut buf = vec![0; RECEIVE_BUFFER_SIZE];
@@ -164,8 +160,8 @@ async fn client_loop(
                                     // collect actor data
                                     connection.initialize(actor_id).await;
 
-                                    exit_position = Some(connection.player_data.position);
-                                    exit_rotation = Some(connection.player_data.rotation);
+                                    connection.exit_position = Some(connection.player_data.position);
+                                    connection.exit_rotation = Some(connection.player_data.rotation);
 
                                     // tell the server we exist, now that we confirmed we are a legitimate connection
                                     connection.handle.send(ToServer::NewClient(client_handle.clone())).await;
@@ -320,7 +316,7 @@ async fn client_loop(
                                         // tell the server we loaded into the zone, so it can start sending us acors
                                         connection.handle.send(ToServer::ZoneLoaded(connection.id)).await;
 
-                                        let common = connection.get_player_common_spawn(exit_position, exit_rotation);
+                                        let common = connection.get_player_common_spawn(connection.exit_position, connection.exit_rotation);
 
                                         // send player spawn
                                         {
@@ -372,8 +368,8 @@ async fn client_loop(
                                         }
 
                                         // wipe any exit position so it isn't accidentally reused
-                                        exit_position = None;
-                                        exit_rotation = None;
+                                        connection.exit_position = None;
+                                        connection.exit_rotation = None;
 
                                         // tell the other players we're here
                                         connection.handle.send(ToServer::ActorSpawned(connection.id, Actor { id: ObjectId(connection.player_data.actor_id), hp: 100, spawn_index: 0 }, common)).await;
@@ -473,27 +469,7 @@ async fn client_loop(
                                     ClientZoneIpcData::LogOut { .. } => {
                                         tracing::info!("Recieved log out from client!");
 
-                                        // write the player back to the database
-                                        database.commit_player_data(&connection.player_data);
-
-                                        // tell the client to disconnect
-                                        {
-                                            let ipc = ServerZoneIpcSegment {
-                                                op_code: ServerZoneIpcType::LogOutComplete,
-                                                timestamp: timestamp_secs(),
-                                                data: ServerZoneIpcData::LogOutComplete { unk: [0; 8] },
-                                                ..Default::default()
-                                            };
-
-                                            connection
-                                                .send_segment(PacketSegment {
-                                                    source_actor: connection.player_data.actor_id,
-                                                    target_actor: connection.player_data.actor_id,
-                                                    segment_type: SegmentType::Ipc,
-                                                    data: SegmentData::Ipc { data: ipc },
-                                                })
-                                                .await;
-                                        }
+                                        connection.begin_log_out().await;
                                     }
                                     ClientZoneIpcData::Disconnected { .. } => {
                                         tracing::info!("Client disconnected!");
@@ -503,12 +479,60 @@ async fn client_loop(
                                     ClientZoneIpcData::ChatMessage(chat_message) => {
                                         connection.handle.send(ToServer::Message(connection.id, chat_message.message.clone())).await;
 
-                                        ChatHandler::handle_chat_message(
-                                            &mut connection,
-                                            &mut lua_player,
-                                            chat_message,
-                                        )
-                                        .await
+                                        let mut handled = false;
+                                        {
+                                        let parts: Vec<&str> = chat_message.message.split(' ').collect();
+                                        let command_name = &parts[0][1..];
+
+                                        let lua = lua.lock().unwrap();
+                                        let state = lua.app_data_ref::<ExtraLuaState>().unwrap();
+
+                                        if let Some(command_script) =
+                                            state.command_scripts.get(command_name)
+                                            {
+                                                handled = true;
+
+                                                lua.scope(|scope| {
+                                                    let connection_data = scope
+                                                    .create_userdata_ref_mut(&mut lua_player)
+                                                    .unwrap();
+
+                                                    let config = get_config();
+
+                                                    let file_name = format!(
+                                                        "{}/{}",
+                                                        &config.world.scripts_location, command_script
+                                                    );
+                                                    lua.load(
+                                                        std::fs::read(&file_name)
+                                                        .expect("Failed to locate scripts directory!"),
+                                                    )
+                                                    .set_name("@".to_string() + &file_name)
+                                                    .exec()
+                                                    .unwrap();
+
+                                                    let func: Function =
+                                                    lua.globals().get("onCommand").unwrap();
+
+                                                    tracing::info!("{}", &chat_message.message[command_name.len() + 2..]);
+
+                                                    func.call::<()>((&chat_message.message[command_name.len() + 2..], connection_data))
+                                                        .unwrap();
+
+                                                    Ok(())
+                                                })
+                                                .unwrap();
+                                            }
+                                        }
+
+                                        if !handled {
+                                            ChatHandler::handle_chat_message(
+                                                &mut connection,
+                                                &mut lua_player,
+                                                chat_message,
+                                            )
+                                            .await;
+                                        }
                                     }
                                     ClientZoneIpcData::GMCommand { command, arg0, .. } => {
                                         tracing::info!("Got a game master command!");
@@ -573,7 +597,7 @@ async fn client_loop(
                                                 .unwrap();
 
                                             // set the exit position
-                                            exit_position = Some(Position {
+                                            connection.exit_position = Some(Position {
                                                 x: destination_object.transform.translation[0],
                                                 y: destination_object.transform.translation[1],
                                                 z: destination_object.transform.translation[2],
@@ -727,6 +751,66 @@ async fn client_loop(
                                         connection.player_data.inventory.process_action(action);
                                         connection.send_inventory(true).await;
                                     }
+                                    ClientZoneIpcData::StartTalkEvent { actor_id, event_id } => {
+                                        // load event
+                                        {
+                                            let ipc = ServerZoneIpcSegment {
+                                                op_code: ServerZoneIpcType::EventStart,
+                                                timestamp: timestamp_secs(),
+                                                data: ServerZoneIpcData::EventStart(EventStart {
+                                                    target_id: *actor_id,
+                                                    event_id: *event_id,
+                                                    event_type: 1, // talk?
+                                                    ..Default::default()
+                                                }),
+                                                ..Default::default()
+                                            };
+
+                                            connection
+                                            .send_segment(PacketSegment {
+                                                source_actor: connection.player_data.actor_id,
+                                                target_actor: connection.player_data.actor_id,
+                                                segment_type: SegmentType::Ipc,
+                                                data: SegmentData::Ipc { data: ipc },
+                                            })
+                                            .await;
+                                        }
+
+                                        let mut should_cancel = false;
+                                        {
+                                        let lua = lua.lock().unwrap();
+                                        let state = lua.app_data_ref::<ExtraLuaState>().unwrap();
+
+                                        if let Some(event_script) =
+                                            state.event_scripts.get(event_id)
+                                            {
+                                                connection.event = Some(Event::new(*event_id, &event_script));
+                                                connection
+                                                    .event
+                                                    .as_mut()
+                                                    .unwrap()
+                                                    .talk(*actor_id, &mut lua_player);
+                                            } else {
+                                                tracing::warn!("Event {event_id} isn't scripted yet! Ignoring...");
+
+                                                should_cancel = true;
+                                            }
+                                        }
+
+                                        if should_cancel {
+                                                // give control back to the player so they aren't stuck
+                                                connection.event_finish(*event_id).await;
+                                            }
+                                    }
+                                    ClientZoneIpcData::EventHandlerReturn { handler_id, scene, error_code, num_results, results } => {
+                                        tracing::info!("Finishing this event... {handler_id} {scene} {error_code} {num_results} {results:#?}");
+
+                                        connection
+                                            .event
+                                            .as_mut()
+                                            .unwrap()
+                                            .finish(*scene, results, &mut lua_player);
+                                    }
                                 }
                             }
                             SegmentData::KeepAliveRequest { id, timestamp } => {
@@ -742,223 +826,7 @@ async fn client_loop(
                             SegmentData::KeepAliveResponse { .. } => {
                                 tracing::info!("Got keep alive response from client... cool...");
                             }
-                            SegmentData::KawariIpc { data } => {
-                                match &data.data {
-                                    CustomIpcData::RequestCreateCharacter {
-                                        service_account_id,
-                                        name,
-                                        chara_make_json,
-                                    } => {
-                                        tracing::info!("creating character from: {name} {chara_make_json}");
-
-                                        let chara_make = CharaMake::from_json(chara_make_json);
-
-                                        let city_state;
-                                        {
-                                            let mut game_data = game_data.lock().unwrap();
-
-                                            city_state =
-                                                game_data.get_citystate(chara_make.classjob_id as u16);
-                                        }
-
-                                        let mut inventory = Inventory::default();
-                                        {
-                                            let mut game_data = game_data.lock().unwrap();
-
-                                            // fill inventory
-                                            inventory.equip_racial_items(
-                                                chara_make.customize.race,
-                                                chara_make.customize.gender,
-                                                &mut game_data,
-                                            );
-                                        }
-
-                                        let (content_id, actor_id) = database.create_player_data(
-                                            *service_account_id,
-                                            name,
-                                            chara_make_json,
-                                            city_state,
-                                            determine_initial_starting_zone(city_state),
-                                            inventory
-                                        );
-
-                                        tracing::info!("Created new player: {content_id} {actor_id}");
-
-                                        // send them the new actor and content id
-                                        {
-                                            connection
-                                                .send_segment(PacketSegment {
-                                                    segment_type: SegmentType::KawariIpc,
-                                                    data: SegmentData::KawariIpc {
-                                                        data: CustomIpcSegment {
-                                                            op_code: CustomIpcType::CharacterCreated,
-                                                            data: CustomIpcData::CharacterCreated {
-                                                                actor_id,
-                                                                content_id,
-                                                            },
-                                                            ..Default::default()
-                                                        },
-                                                    },
-                                                    ..Default::default()
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                    CustomIpcData::GetActorId { content_id } => {
-                                        let actor_id = database.find_actor_id(*content_id);
-
-                                        tracing::info!("We found an actor id: {actor_id}");
-
-                                        // send them the actor id
-                                        {
-                                            connection
-                                                .send_segment(PacketSegment {
-                                                    segment_type: SegmentType::KawariIpc,
-                                                    data: SegmentData::KawariIpc {
-                                                        data: CustomIpcSegment {
-                                                            op_code: CustomIpcType::ActorIdFound,
-                                                            data: CustomIpcData::ActorIdFound { actor_id },
-                                                            ..Default::default()
-                                                        },
-                                                    },
-                                                    ..Default::default()
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                    CustomIpcData::CheckNameIsAvailable { name } => {
-                                        let is_name_free = database.check_is_name_free(name);
-
-                                        // send response
-                                        {
-                                            connection
-                                                .send_segment(PacketSegment {
-                                                    segment_type: SegmentType::KawariIpc,
-                                                    data: SegmentData::KawariIpc {
-                                                        data: CustomIpcSegment {
-                                                            op_code: CustomIpcType::NameIsAvailableResponse,
-                                                            data: CustomIpcData::NameIsAvailableResponse {
-                                                                free: is_name_free,
-                                                            },
-                                                            ..Default::default()
-                                                        },
-                                                    },
-                                                    ..Default::default()
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                    CustomIpcData::RequestCharacterList { service_account_id } => {
-                                        let config = get_config();
-
-                                        let world_name;
-                                        {
-                                            let mut game_data = game_data.lock().unwrap();
-                                            world_name = game_data.get_world_name(config.world.world_id);
-                                        }
-
-                                        let characters;
-                                        {
-                                            let mut game_data = game_data.lock().unwrap();
-
-                                            characters = database.get_character_list(
-                                                *service_account_id,
-                                                config.world.world_id,
-                                                &world_name,
-                                                &mut game_data,
-                                            );
-                                        }
-
-                                        // send response
-                                        {
-                                            send_packet::<CustomIpcSegment>(
-                                                        &mut connection.socket,
-                                                        &mut connection.state,
-                                                        ConnectionType::None,
-                                                        CompressionType::Uncompressed,
-                                                        &[PacketSegment {
-                                                            segment_type: SegmentType::KawariIpc,
-                                                            data: SegmentData::KawariIpc {
-                                                                data: CustomIpcSegment {
-                                                                    op_code: CustomIpcType::RequestCharacterListRepsonse,
-                                                                    data: CustomIpcData::RequestCharacterListRepsonse {
-                                                                        characters
-                                                                    },
-                                                                    ..Default::default()
-                                                                },
-                                                            },
-                                                            ..Default::default()
-                                                        }],
-                                                    )
-                                                    .await;
-                                        }
-                                    }
-                                    CustomIpcData::DeleteCharacter { content_id } => {
-                                        database.delete_character(*content_id);
-
-                                        // send response
-                                        {
-                                            send_packet::<CustomIpcSegment>(
-                                                &mut connection.socket,
-                                                &mut connection.state,
-                                                ConnectionType::None,
-                                                CompressionType::Uncompressed,
-                                                &[PacketSegment {
-                                                    segment_type: SegmentType::KawariIpc,
-                                                    data: SegmentData::KawariIpc {
-                                                        data: CustomIpcSegment {
-                                                            op_code: CustomIpcType::CharacterDeleted,
-                                                            data: CustomIpcData::CharacterDeleted {
-                                                                deleted: 1,
-                                                            },
-                                                            ..Default::default()
-                                                        },
-                                                    },
-                                                    ..Default::default()
-                                                }],
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    CustomIpcData::ImportCharacter { service_account_id, path } => {
-                                        database.import_character(*service_account_id, path);
-                                    }
-                                    CustomIpcData::RemakeCharacter { content_id, chara_make_json } => {
-                                        // overwrite it in the database
-                                        database.set_chara_make(*content_id, chara_make_json);
-
-                                        // reset flag
-                                        database.set_remake_mode(*content_id, RemakeMode::None);
-
-                                        // send response
-                                        {
-                                            send_packet::<CustomIpcSegment>(
-                                                &mut connection.socket,
-                                                &mut connection.state,
-                                                ConnectionType::None,
-                                                CompressionType::Uncompressed,
-                                                &[PacketSegment {
-                                                    segment_type: SegmentType::KawariIpc,
-                                                    data: SegmentData::KawariIpc {
-                                                        data: CustomIpcSegment {
-                                                            op_code: CustomIpcType::CharacterRemade,
-                                                            data: CustomIpcData::CharacterRemade {
-                                                                content_id: *content_id,
-                                                            },
-                                                            ..Default::default()
-                                                        },
-                                                    },
-                                                    ..Default::default()
-                                                }],
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    _ => {
-                                        panic!("The server is recieving a response or unknown custom IPC!")
-                                    }
-                                }
-                            }
+                            SegmentData::KawariIpc { data } => handle_custom_ipc(&mut connection, data).await,
                             _ => {
                                 panic!("The server is recieving a response or unknown packet!")
                             }
@@ -1038,9 +906,33 @@ async fn main() {
             })
             .unwrap();
 
+        let register_event_func = lua
+            .create_function(|lua, (event_id, event_script): (u32, String)| {
+                tracing::info!("Registering {event_id} with {event_script}!");
+                let mut state = lua.app_data_mut::<ExtraLuaState>().unwrap();
+                let _ = state.event_scripts.insert(event_id, event_script);
+                Ok(())
+            })
+            .unwrap();
+
+        let register_command_func = lua
+            .create_function(|lua, (command_name, command_script): (String, String)| {
+                tracing::info!("Registering {command_name} with {command_script}!");
+                let mut state = lua.app_data_mut::<ExtraLuaState>().unwrap();
+                let _ = state.command_scripts.insert(command_name, command_script);
+                Ok(())
+            })
+            .unwrap();
+
         lua.set_app_data(ExtraLuaState::default());
         lua.globals()
             .set("registerAction", register_action_func)
+            .unwrap();
+        lua.globals()
+            .set("registerEvent", register_event_func)
+            .unwrap();
+        lua.globals()
+            .set("registerCommand", register_command_func)
             .unwrap();
 
         let effectsbuilder_constructor = lua
@@ -1086,6 +978,8 @@ async fn main() {
                     database: database.clone(),
                     lua: lua.clone(),
                     gamedata: game_data.clone(),
+                             exit_position: None,
+                             exit_rotation: None,
                 });
             }
             Some((mut socket, _)) = handle_rcon(&rcon_listener) => {

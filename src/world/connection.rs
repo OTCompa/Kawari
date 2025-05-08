@@ -152,6 +152,9 @@ pub struct ZoneConnection {
     pub database: Arc<WorldDatabase>,
     pub lua: Arc<Mutex<mlua::Lua>>,
     pub gamedata: Arc<Mutex<GameData>>,
+
+    pub exit_position: Option<Position>,
+    pub exit_rotation: Option<f32>,
 }
 
 impl ZoneConnection {
@@ -422,6 +425,31 @@ impl ZoneConnection {
         }
     }
 
+    pub async fn warp(&mut self, warp_id: u32) {
+        let territory_type;
+        // find the pop range on the other side
+        {
+            let mut game_data = self.gamedata.lock().unwrap();
+            let (pop_range_id, zone_id) = game_data.get_warp(warp_id);
+
+            let new_zone = Zone::load(&mut game_data.game_data, zone_id);
+
+            // find it on the other side
+            let (object, _) = new_zone.find_pop_range(pop_range_id).unwrap();
+
+            // set the exit position
+            self.exit_position = Some(Position {
+                x: object.transform.translation[0],
+                y: object.transform.translation[1],
+                z: object.transform.translation[2],
+            });
+
+            territory_type = zone_id;
+        }
+
+        self.change_zone(territory_type as u16).await;
+    }
+
     pub async fn change_weather(&mut self, new_weather_id: u16) {
         let ipc = ServerZoneIpcSegment {
             op_code: ServerZoneIpcType::WeatherId,
@@ -569,9 +597,84 @@ impl ZoneConnection {
                 Task::SetRemakeMode(remake_mode) => self
                     .database
                     .set_remake_mode(player.player_data.content_id, *remake_mode),
+                Task::Warp { warp_id } => {
+                    self.warp(*warp_id).await;
+                }
+                Task::BeginLogOut => self.begin_log_out().await,
+                Task::FinishEvent { handler_id } => self.event_finish(*handler_id).await,
+                Task::SetClassJob { classjob_id } => {
+                    self.player_data.classjob_id = *classjob_id;
+                    self.update_class_info().await;
+                }
             }
         }
         player.queued_tasks.clear();
+    }
+
+    pub async fn event_finish(&mut self, handler_id: u32) {
+        // sent event finish
+        {
+            let ipc = ServerZoneIpcSegment {
+                op_code: ServerZoneIpcType::EventFinish,
+                timestamp: timestamp_secs(),
+                data: ServerZoneIpcData::EventFinish {
+                    handler_id,
+                    event: 1,
+                    result: 1,
+                    arg: 0,
+                },
+                ..Default::default()
+            };
+
+            self.send_segment(PacketSegment {
+                source_actor: self.player_data.actor_id,
+                target_actor: self.player_data.actor_id,
+                segment_type: SegmentType::Ipc,
+                data: SegmentData::Ipc { data: ipc },
+            })
+            .await;
+        }
+
+        // give back control to the player
+        {
+            let ipc = ServerZoneIpcSegment {
+                op_code: ServerZoneIpcType::Unk18,
+                timestamp: timestamp_secs(),
+                data: ServerZoneIpcData::Unk18 { unk: [0; 16] },
+                ..Default::default()
+            };
+
+            self.send_segment(PacketSegment {
+                source_actor: self.player_data.actor_id,
+                target_actor: self.player_data.actor_id,
+                segment_type: SegmentType::Ipc,
+                data: SegmentData::Ipc { data: ipc },
+            })
+            .await;
+        }
+    }
+
+    pub async fn begin_log_out(&mut self) {
+        // write the player back to the database
+        self.database.commit_player_data(&self.player_data);
+
+        // tell the client we're ready to disconnect at any moment'
+        {
+            let ipc = ServerZoneIpcSegment {
+                op_code: ServerZoneIpcType::LogOutComplete,
+                timestamp: timestamp_secs(),
+                data: ServerZoneIpcData::LogOutComplete { unk: [0; 8] },
+                ..Default::default()
+            };
+
+            self.send_segment(PacketSegment {
+                source_actor: self.player_data.actor_id,
+                target_actor: self.player_data.actor_id,
+                segment_type: SegmentType::Ipc,
+                data: SegmentData::Ipc { data: ipc },
+            })
+            .await;
+        }
     }
 
     pub async fn process_effects_list(&mut self) {

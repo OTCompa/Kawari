@@ -1,6 +1,6 @@
 use mlua::{Function, Lua};
 
-use crate::config::get_config;
+use crate::{common::ObjectTypeId, config::get_config};
 
 use super::{LuaPlayer, Zone};
 
@@ -9,7 +9,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new(path: &str) -> Self {
+    pub fn new(id: u32, path: &str) -> Self {
         let lua = Lua::new();
 
         let config = get_config();
@@ -18,6 +18,8 @@ impl Event {
             .set_name("@".to_string() + &file_name)
             .exec()
             .unwrap();
+
+        lua.globals().set("EVENT_ID", id).unwrap();
 
         Self { lua }
     }
@@ -45,6 +47,34 @@ impl Event {
                 let func: Function = self.lua.globals().get("onSceneFinished").unwrap();
 
                 func.call::<()>((player, scene)).unwrap();
+
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    pub fn talk(&mut self, target_id: ObjectTypeId, player: &mut LuaPlayer) {
+        self.lua
+            .scope(|scope| {
+                let player = scope.create_userdata_ref_mut(player).unwrap();
+
+                let func: Function = self.lua.globals().get("onTalk").unwrap();
+
+                func.call::<()>((target_id, player)).unwrap();
+
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    pub fn finish(&mut self, scene: u16, results: &[u32], player: &mut LuaPlayer) {
+        self.lua
+            .scope(|scope| {
+                let player = scope.create_userdata_ref_mut(player).unwrap();
+
+                let func: Function = self.lua.globals().get("onReturn").unwrap();
+
+                func.call::<()>((scene, results, player)).unwrap();
 
                 Ok(())
             })

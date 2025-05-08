@@ -1,10 +1,8 @@
 use crate::{
-    common::{CustomizeData, ObjectId, ObjectTypeId, Position, timestamp_secs},
-    config::get_config,
+    common::{CustomizeData, ObjectId, ObjectTypeId, timestamp_secs},
     ipc::zone::{
-        ActorControl, ActorControlCategory, BattleNpcSubKind, ChatMessage, CommonSpawn,
-        DisplayFlag, EventStart, NpcSpawn, ObjectKind, OnlineStatus, PlayerSpawn, PlayerSubKind,
-        ServerZoneIpcData, ServerZoneIpcSegment,
+        ActorControl, ActorControlCategory, BattleNpcSubKind, ChatMessage, CommonSpawn, EventStart,
+        NpcSpawn, ObjectKind, OnlineStatus, ServerZoneIpcData, ServerZoneIpcSegment,
     },
     opcodes::ServerZoneIpcType,
     packet::{PacketSegment, SegmentData, SegmentType},
@@ -54,102 +52,6 @@ impl ChatHandler {
 
         let parts: Vec<&str> = chat_message.message.split(' ').collect();
         match parts[0] {
-            "!setpos" => {
-                let pos_x = parts[1].parse::<f32>().unwrap();
-                let pos_y = parts[2].parse::<f32>().unwrap();
-                let pos_z = parts[3].parse::<f32>().unwrap();
-
-                connection
-                    .set_player_position(Position {
-                        x: pos_x,
-                        y: pos_y,
-                        z: pos_z,
-                    })
-                    .await;
-            }
-            "!spawnplayer" => {
-                let config = get_config();
-
-                // send player spawn
-                {
-                    let ipc = ServerZoneIpcSegment {
-                        unk1: 20,
-                        unk2: 0,
-                        op_code: ServerZoneIpcType::PlayerSpawn,
-                        option: 0,
-                        timestamp: timestamp_secs(),
-                        data: ServerZoneIpcData::PlayerSpawn(PlayerSpawn {
-                            account_id: 1000000,
-                            content_id: 1000000,
-                            current_world_id: config.world.world_id,
-                            home_world_id: config.world.world_id,
-                            common: CommonSpawn {
-                                class_job: 35,
-                                name: "Test Actor".to_string(),
-                                hp_curr: 250,
-                                hp_max: 250,
-                                mp_curr: 10000,
-                                mp_max: 10000,
-                                level: 5,
-                                object_kind: ObjectKind::Player(PlayerSubKind::Player),
-                                spawn_index: connection.get_free_spawn_index(),
-                                look: CUSTOMIZE_DATA,
-                                display_flags: DisplayFlag::INVISIBLE
-                                    | DisplayFlag::HIDE_HEAD
-                                    | DisplayFlag::UNK,
-                                models: [
-                                    0,  // head
-                                    89, // body
-                                    89, // hands
-                                    89, // legs
-                                    89, // feet
-                                    0,  // ears
-                                    0,  // neck
-                                    0,  // wrists
-                                    0,  // left finger
-                                    0,  // right finger
-                                ],
-                                pos: connection.player_data.position,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }),
-                    };
-
-                    connection
-                        .send_segment(PacketSegment {
-                            source_actor: 0x106ad804,
-                            target_actor: connection.player_data.actor_id,
-                            segment_type: SegmentType::Ipc,
-                            data: SegmentData::Ipc { data: ipc },
-                        })
-                        .await;
-                }
-
-                // zone in
-                {
-                    let ipc = ServerZoneIpcSegment {
-                        op_code: ServerZoneIpcType::ActorControl,
-                        timestamp: timestamp_secs(),
-                        data: ServerZoneIpcData::ActorControl(ActorControl {
-                            category: ActorControlCategory::ZoneIn {
-                                warp_finish_anim: 0x0,
-                                raise_anim: 0x0,
-                            },
-                        }),
-                        ..Default::default()
-                    };
-
-                    connection
-                        .send_segment(PacketSegment {
-                            source_actor: 0x106ad804,
-                            target_actor: connection.player_data.actor_id,
-                            segment_type: SegmentType::Ipc,
-                            data: SegmentData::Ipc { data: ipc },
-                        })
-                        .await;
-                }
-            }
             "!spawnnpc" => {
                 let ipc = ServerZoneIpcSegment {
                     op_code: ServerZoneIpcType::NpcSpawn,
@@ -311,9 +213,9 @@ impl ChatHandler {
                 }
 
                 let event = match event_id {
-                    1245185 => Event::new("opening/OpeningLimsaLominsa.lua"),
-                    1245186 => Event::new("opening/OpeningGridania.lua"),
-                    1245187 => Event::new("opening/OpeningUldah.lua"),
+                    1245185 => Event::new(1245185, "opening/OpeningLimsaLominsa.lua"),
+                    1245186 => Event::new(1245186, "opening/OpeningGridania.lua"),
+                    1245187 => Event::new(1245187, "opening/OpeningUldah.lua"),
                     _ => panic!("Unsupported event!"),
                 };
 
@@ -351,13 +253,7 @@ impl ChatHandler {
                     })
                     .await;
             }
-            "!classjob" => {
-                let parts: Vec<&str> = chat_message.message.split(' ').collect();
-
-                connection.player_data.classjob_id = parts[1].parse::<u8>().unwrap();
-                connection.update_class_info().await;
-            }
-            _ => tracing::info!("Unrecognized debug command!"),
+            _ => {}
         }
     }
 }

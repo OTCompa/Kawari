@@ -1,4 +1,4 @@
-use mlua::{FromLua, Lua, LuaSerdeExt, UserData, UserDataMethods, Value};
+use mlua::{FromLua, Lua, LuaSerdeExt, UserData, UserDataFields, UserDataMethods, Value};
 
 use crate::{
     common::{ObjectId, ObjectTypeId, Position, timestamp_secs, workdefinitions::RemakeMode},
@@ -15,6 +15,10 @@ use super::{PlayerData, StatusEffects, Zone};
 pub enum Task {
     ChangeTerritory { zone_id: u16 },
     SetRemakeMode(RemakeMode),
+    Warp { warp_id: u32 },
+    BeginLogOut,
+    FinishEvent { handler_id: u32 },
+    SetClassJob { classjob_id: u8 },
 }
 
 #[derive(Default)]
@@ -53,15 +57,19 @@ impl LuaPlayer {
         self.status_effects.add(effect_id, duration);
     }
 
-    fn play_scene(&mut self, event_id: u32, scene: u16, scene_flags: u32, param: u8) {
+    fn play_scene(
+        &mut self,
+        target: ObjectTypeId,
+        event_id: u32,
+        scene: u16,
+        scene_flags: u32,
+        param: u8,
+    ) {
         let ipc = ServerZoneIpcSegment {
             op_code: ServerZoneIpcType::EventScene,
             timestamp: timestamp_secs(),
             data: ServerZoneIpcData::EventScene(EventScene {
-                actor_id: ObjectTypeId {
-                    object_id: ObjectId(self.player_data.actor_id),
-                    object_type: 0,
-                },
+                actor_id: target,
                 event_id,
                 scene,
                 scene_flags,
@@ -105,6 +113,22 @@ impl LuaPlayer {
     fn set_remake_mode(&mut self, mode: RemakeMode) {
         self.queued_tasks.push(Task::SetRemakeMode(mode));
     }
+
+    fn warp(&mut self, warp_id: u32) {
+        self.queued_tasks.push(Task::Warp { warp_id });
+    }
+
+    fn begin_log_out(&mut self) {
+        self.queued_tasks.push(Task::BeginLogOut);
+    }
+
+    fn finish_event(&mut self, handler_id: u32) {
+        self.queued_tasks.push(Task::FinishEvent { handler_id });
+    }
+
+    fn set_classjob(&mut self, classjob_id: u8) {
+        self.queued_tasks.push(Task::SetClassJob { classjob_id });
+    }
 }
 
 impl UserData for LuaPlayer {
@@ -122,12 +146,13 @@ impl UserData for LuaPlayer {
         );
         methods.add_method_mut(
             "play_scene",
-            |_, this, (event_id, scene, scene_flags, param): (u32, u16, u32, u8)| {
-                this.play_scene(event_id, scene, scene_flags, param);
+            |_, this, (target, event_id, scene, scene_flags, param): (ObjectTypeId, u32, u16, u32, u8)| {
+                this.play_scene(target, event_id, scene, scene_flags, param);
                 Ok(())
             },
         );
-        methods.add_method_mut("set_position", |_, this, position: Position| {
+        methods.add_method_mut("set_position", |lua, this, position: Value| {
+            let position: Position = lua.from_value(position).unwrap();
             this.set_position(position);
             Ok(())
         });
@@ -140,12 +165,39 @@ impl UserData for LuaPlayer {
             this.set_remake_mode(mode);
             Ok(())
         });
+        methods.add_method_mut("warp", |_, this, warp_id: u32| {
+            this.warp(warp_id);
+            Ok(())
+        });
+        methods.add_method_mut("begin_log_out", |_, this, _: ()| {
+            this.begin_log_out();
+            Ok(())
+        });
+        methods.add_method_mut("finish_event", |_, this, handler_id: u32| {
+            this.finish_event(handler_id);
+            Ok(())
+        });
+        methods.add_method_mut("set_classjob", |_, this, classjob_id: u8| {
+            this.set_classjob(classjob_id);
+            Ok(())
+        });
+    }
+
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("id", |_, this| {
+            Ok(ObjectTypeId {
+                object_id: ObjectId(this.player_data.actor_id),
+                object_type: 0,
+            })
+        });
     }
 }
 
 impl UserData for Position {}
 
-impl FromLua for Position {
+impl UserData for ObjectTypeId {}
+
+impl FromLua for ObjectTypeId {
     fn from_lua(value: Value, _: &Lua) -> mlua::Result<Self> {
         match value {
             Value::UserData(ud) => Ok(*ud.borrow::<Self>()?),

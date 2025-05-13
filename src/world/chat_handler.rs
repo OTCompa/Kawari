@@ -1,12 +1,14 @@
 use crate::{
     common::{CustomizeData, ObjectId, ObjectTypeId, timestamp_secs},
+    inventory::Storage,
     ipc::zone::{
-        ActorControl, ActorControlCategory, BattleNpcSubKind, ChatMessage, CommonSpawn, EventStart,
-        NpcSpawn, ObjectKind, OnlineStatus, ServerZoneIpcData, ServerZoneIpcSegment,
+        ActorControl, ActorControlCategory, ActorControlSelf, BattleNpcSubKind, ChatMessage,
+        CommonSpawn, EventStart, NpcSpawn, ObjectKind, OnlineStatus, ServerZoneIpcData,
+        ServerZoneIpcSegment,
     },
     opcodes::ServerZoneIpcType,
     packet::{PacketSegment, SegmentData, SegmentType},
-    world::{Actor, Event},
+    world::{Event, ToServer},
 };
 
 use super::{LuaPlayer, ZoneConnection};
@@ -102,60 +104,10 @@ impl ChatHandler {
                     .await;
             }
             "!spawnmonster" => {
-                let spawn_index = connection.get_free_spawn_index();
-                
-                let bnpc_id: u32;
-                let model_id: u16;
-                if parts.len() > 2 {
-                    bnpc_id = parts[1].parse::<u32>().unwrap();
-                    model_id = parts[2].parse::<u16>().unwrap();
-                } else {
-                    bnpc_id = 13498;
-                    model_id = 297;
-                }
-
-                // spawn a tiny mandragora
-                {
-                    let ipc = ServerZoneIpcSegment {
-                        op_code: ServerZoneIpcType::NpcSpawn,
-                        timestamp: timestamp_secs(),
-                        data: ServerZoneIpcData::NpcSpawn(NpcSpawn {
-                            aggression_mode: 1,
-                            common: CommonSpawn {
-                                hp_curr: 91,
-                                hp_max: 91,
-                                mp_curr: 100,
-                                mp_max: 100,
-                                spawn_index,
-                                bnpc_base: bnpc_id, // TODO: changing this prevents it from spawning...
-                                bnpc_name: 405,
-                                object_kind: ObjectKind::BattleNpc(BattleNpcSubKind::Enemy),
-                                level: 1,
-                                battalion: 4,
-                                model_chara: model_id,
-                                pos: connection.player_data.position,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    };
-
-                    connection
-                        .send_segment(PacketSegment {
-                            source_actor: 0x106ad804,
-                            target_actor: connection.player_data.actor_id,
-                            segment_type: SegmentType::Ipc,
-                            data: SegmentData::Ipc { data: ipc },
-                        })
-                        .await;
-                }
-
-                connection.actors.push(Actor {
-                    id: ObjectId(0x106ad804),
-                    hp: 91,
-                    spawn_index: spawn_index as u32,
-                });
+                connection
+                    .handle
+                    .send(ToServer::DebugNewNpc(connection.id))
+                    .await;
             }
             "!playscene" => {
                 let parts: Vec<&str> = chat_message.message.split(' ').collect();
@@ -252,6 +204,42 @@ impl ChatHandler {
                         data: SegmentData::Ipc { data: ipc },
                     })
                     .await;
+            }
+            "!unlockaction" => {
+                let parts: Vec<&str> = chat_message.message.split(' ').collect();
+                let id = parts[1].parse::<u32>().unwrap();
+
+                connection
+                    .actor_control_self(ActorControlSelf {
+                        category: ActorControlCategory::ToggleActionUnlock { id, unlocked: true },
+                    })
+                    .await;
+            }
+            "!equip" => {
+                let (_, name) = chat_message.message.split_once(' ').unwrap();
+
+                {
+                    let mut gamedata = connection.gamedata.lock().unwrap();
+
+                    if let Some((equip_category, id)) = gamedata.get_item_by_name(name) {
+                        let slot = gamedata.get_equipslot_category(equip_category).unwrap();
+
+                        connection
+                            .player_data
+                            .inventory
+                            .equipped
+                            .get_slot_mut(slot as u16)
+                            .id = id;
+                        connection
+                            .player_data
+                            .inventory
+                            .equipped
+                            .get_slot_mut(slot as u16)
+                            .quantity = 1;
+                    }
+                }
+
+                connection.send_inventory(true).await;
             }
             _ => {}
         }

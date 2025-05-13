@@ -104,7 +104,7 @@ pub enum OnlineStatus {
 #[binrw]
 #[brw(little)]
 #[brw(repr = u8)]
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum GameMasterRank {
     #[default]
     NormalUser,
@@ -116,9 +116,29 @@ pub enum GameMasterRank {
     Debug = 90,
 }
 
+impl TryFrom<u8> for GameMasterRank {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::NormalUser),
+            1 => Ok(Self::GameMaster),
+            3 => Ok(Self::EventJunior),
+            4 => Ok(Self::EventSenior),
+            5 => Ok(Self::Support),
+            7 => Ok(Self::Senior),
+            90 => Ok(Self::Debug),
+            _ => Err(()),
+        }
+    }
+}
+
+#[binrw]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayFlag(u32);
+
 bitflags! {
-    #[binrw]
-    pub struct DisplayFlag : u32 {
+    impl DisplayFlag : u32 {
         const NONE = 0x0;
         // Can be made visible with ActorControl I think
         const INVISIBLE = 0x20;

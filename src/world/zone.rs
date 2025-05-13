@@ -1,3 +1,4 @@
+use icarus::TerritoryType::TerritoryTypeSheet;
 use physis::{
     common::Language,
     gamedata::GameData,
@@ -7,7 +8,7 @@ use physis::{
 };
 
 /// Represents a loaded zone
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Zone {
     pub id: u16,
     planevent: Option<LayerGroup>,
@@ -26,22 +27,11 @@ impl Zone {
             ..Default::default()
         };
 
-        let Some(exh) = game_data.read_excel_sheet_header("TerritoryType") else {
-            return zone;
-        };
-        let Some(exd) = game_data.read_excel_sheet("TerritoryType", &exh, Language::None, 0) else {
-            return zone;
-        };
-
-        let Some(territory_type_row) = &exd.read_row(&exh, id as u32) else {
-            return zone;
-        };
-        let territory_type_row = &territory_type_row[0];
+        let sheet = TerritoryTypeSheet::read_from(game_data, Language::None).unwrap();
+        let row = sheet.get_row(id as u32).unwrap();
 
         // e.g. ffxiv/fst_f1/fld/f1f3/level/f1f3
-        let physis::exd::ColumnData::String(bg_path) = &territory_type_row.data[1] else {
-            panic!("Unexpected type!");
-        };
+        let bg_path = row.Bg().into_string().unwrap();
 
         let Some(level_index) = bg_path.find("/level/") else {
             return zone;
@@ -89,22 +79,26 @@ impl Zone {
         instance_id: u32,
     ) -> Option<(&InstanceObject, &PopRangeInstanceObject)> {
         // TODO: also check position!
-        for group in &self.planmap.as_ref().unwrap().chunks[0].layers {
-            for object in &group.objects {
-                if let LayerEntryData::PopRange(pop_range) = &object.data {
-                    if object.instance_id == instance_id {
-                        return Some((object, pop_range));
+        if let Some(planmap) = self.planmap.as_ref() {
+            for group in &planmap.chunks[0].layers {
+                for object in &group.objects {
+                    if let LayerEntryData::PopRange(pop_range) = &object.data {
+                        if object.instance_id == instance_id {
+                            return Some((object, pop_range));
+                        }
                     }
                 }
             }
         }
 
-        // For certain PopRanges (e.g. the starting position in the opening zones)
-        for group in &self.planevent.as_ref().unwrap().chunks[0].layers {
-            for object in &group.objects {
-                if let LayerEntryData::PopRange(pop_range) = &object.data {
-                    if object.instance_id == instance_id {
-                        return Some((object, pop_range));
+        if let Some(planevent) = self.planevent.as_ref() {
+            // For certain PopRanges (e.g. the starting position in the opening zones)
+            for group in &planevent.chunks[0].layers {
+                for object in &group.objects {
+                    if let LayerEntryData::PopRange(pop_range) = &object.data {
+                        if object.instance_id == instance_id {
+                            return Some((object, pop_range));
+                        }
                     }
                 }
             }

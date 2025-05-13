@@ -15,3 +15,4 @@ backups/
 *.lib
 *.exp
 diff.json
+temp.zip

@@ -27,7 +27,9 @@ async fn main() {
     tracing::info!("Server started on {addr}");
 
     let mut game_data = GameData::new();
-    let world_name = game_data.get_world_name(config.world.world_id);
+    let world_name = game_data
+        .get_world_name(config.world.world_id)
+        .expect("Unknown world name");
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -90,9 +92,14 @@ async fn main() {
                                     let service_accounts: Option<Vec<ServiceAccount>> =
                                         serde_json::from_str(&body).ok();
                                     if let Some(service_accounts) = service_accounts {
-                                        connection.service_accounts = service_accounts;
-                                        connection.session_id = Some(session_id.clone());
-                                        connection.send_account_list().await;
+                                        if service_accounts.is_empty() {
+                                            // request an update, wrong error message lol
+                                            connection.send_error(*sequence, 1012, 13101).await;
+                                        } else {
+                                            connection.service_accounts = service_accounts;
+                                            connection.session_id = Some(session_id.clone());
+                                            connection.send_account_list().await;
+                                        }
                                     } else {
                                         // request an update, wrong error message lol
                                         connection.send_error(*sequence, 1012, 13101).await;

@@ -1,12 +1,10 @@
 use std::{
     net::SocketAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
-use tokio::{net::TcpStream, sync::mpsc::Sender};
+use tokio::net::TcpStream;
 
 use crate::{
     OBFUSCATION_ENABLED_MODE,
@@ -16,10 +14,10 @@ use crate::{
     ipc::{
         chat::ServerChatIpcSegment,
         zone::{
-            ActorControlSelf, ClientZoneIpcSegment, CommonSpawn, ContainerInfo, DisplayFlag, Equip,
-            InitZone, ItemInfo, Move, NpcSpawn, ObjectKind, PlayerStats, PlayerSubKind,
-            ServerZoneIpcData, ServerZoneIpcSegment, StatusEffect, StatusEffectList,
-            UpdateClassInfo, Warp, WeatherChange,
+            ActorControl, ActorControlSelf, ActorControlTarget, ClientZoneIpcSegment, CommonSpawn,
+            ContainerInfo, DisplayFlag, Equip, GameMasterRank, InitZone, ItemInfo, Move, NpcSpawn,
+            ObjectKind, PlayerStats, PlayerSubKind, ServerZoneIpcData, ServerZoneIpcSegment,
+            StatusEffect, StatusEffectList, UpdateClassInfo, Warp, WeatherChange,
         },
     },
     opcodes::ServerZoneIpcType,
@@ -30,8 +28,15 @@ use crate::{
 };
 
 use super::{
-    Actor, CharacterData, Event, LuaPlayer, StatusEffects, WorldDatabase, Zone, lua::Task,
+    Actor, CharacterData, Event, LuaPlayer, StatusEffects, ToServer, WorldDatabase, Zone,
+    common::{ClientId, ServerHandle},
+    lua::Task,
 };
+
+#[derive(Debug, Default, Clone)]
+pub struct TeleportQuery {
+    pub aetheryte_id: u16,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct PlayerData {
@@ -53,80 +58,9 @@ pub struct PlayerData {
     pub rotation: f32,
     pub zone_id: u16,
     pub inventory: Inventory,
-}
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ClientId(usize);
-
-pub enum FromServer {
-    /// A chat message.
-    Message(String),
-    /// An actor has been spawned.
-    ActorSpawn(Actor, CommonSpawn),
-    /// An actor moved to a new position.
-    ActorMove(u32, Position, f32),
-    // An actor has despawned.
-    ActorDespawn(u32),
-}
-
-#[derive(Debug, Clone)]
-pub struct ClientHandle {
-    pub id: ClientId,
-    pub ip: SocketAddr,
-    pub channel: Sender<FromServer>,
-    // TODO: restore, i guess
-    //pub kill: JoinHandle<()>,
-}
-
-impl ClientHandle {
-    /// Send a message to this client actor. Will emit an error if sending does
-    /// not succeed immediately, as this means that forwarding messages to the
-    /// tcp connection cannot keep up.
-    pub fn send(&mut self, msg: FromServer) -> Result<(), std::io::Error> {
-        if self.channel.try_send(msg).is_err() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Can't keep up or dead",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Kill the actor.
-    pub fn kill(self) {
-        // run the destructor
-        drop(self);
-    }
-}
-
-pub enum ToServer {
-    NewClient(ClientHandle),
-    Message(ClientId, String),
-    ActorSpawned(ClientId, Actor, CommonSpawn),
-    ActorMoved(ClientId, u32, Position, f32),
-    ActorDespawned(ClientId, u32),
-    ZoneLoaded(ClientId),
-    Disconnected(ClientId),
-    FatalError(std::io::Error),
-}
-
-#[derive(Clone, Debug)]
-pub struct ServerHandle {
-    pub chan: Sender<ToServer>,
-    pub next_id: Arc<AtomicUsize>,
-}
-
-impl ServerHandle {
-    pub async fn send(&mut self, msg: ToServer) {
-        if self.chan.send(msg).await.is_err() {
-            panic!("Main loop has shut down.");
-        }
-    }
-    pub fn next_id(&self) -> ClientId {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        ClientId(id)
-    }
+    pub teleport_query: TeleportQuery,
+    pub gm_rank: GameMasterRank,
 }
 
 /// Represents a single connection between an instance of the client and the world server
@@ -155,6 +89,11 @@ pub struct ZoneConnection {
 
     pub exit_position: Option<Position>,
     pub exit_rotation: Option<f32>,
+
+    pub last_keep_alive: Instant,
+
+    /// Whether the player was gracefully logged out
+    pub gracefully_logged_out: bool,
 }
 
 impl ZoneConnection {
@@ -259,10 +198,8 @@ impl ZoneConnection {
             timestamp: timestamp_secs(),
             data: ServerZoneIpcData::Move(Move {
                 rotation,
-                dir_before_slip: 0x7F,
-                flag1: 0,
-                flag2: 0,
-                speed: 0x3C,
+                flag1: 128,
+                flag2: 60,
                 position,
             }),
             ..Default::default()
@@ -361,39 +298,27 @@ impl ZoneConnection {
 
     pub async fn change_zone(&mut self, new_zone_id: u16) {
         // tell everyone we're gone
-        // TODO: check if we ever sent an initial ActorSpawn packet first, before sending this.
         // the connection already checks to see if the actor already exists, so it's seems harmless if we do
-        self.handle
-            .send(ToServer::ActorDespawned(self.id, self.player_data.actor_id))
-            .await;
+        if let Some(zone) = &self.zone {
+            self.handle
+                .send(ToServer::LeftZone(
+                    self.id,
+                    self.player_data.actor_id,
+                    zone.id,
+                ))
+                .await;
+        }
 
+        // load the new zone now
         {
             let mut game_data = self.gamedata.lock().unwrap();
             self.zone = Some(Zone::load(&mut game_data.game_data, new_zone_id));
         }
+
         self.player_data.zone_id = new_zone_id;
 
         // Player Class Info
         self.update_class_info().await;
-
-        // link shell information
-        /*{
-            let ipc = ServerZoneIpcSegment {
-                op_code: ServerZoneIpcType::LinkShellInformation,
-                timestamp: timestamp_secs(),
-                data: ServerZoneIpcData::LinkShellInformation { unk: [0; 456] },
-                ..Default::default()
-            };
-
-            self.send_segment(PacketSegment {
-                source_actor: self.player_data.actor_id,
-                target_actor: self.player_data.actor_id,
-                segment_type: SegmentType::Ipc { data: ipc },
-            })
-            .await;
-        }*/
-
-        // TODO: send unk16?
 
         // Init Zone
         {
@@ -430,7 +355,9 @@ impl ZoneConnection {
         // find the pop range on the other side
         {
             let mut game_data = self.gamedata.lock().unwrap();
-            let (pop_range_id, zone_id) = game_data.get_warp(warp_id);
+            let (pop_range_id, zone_id) = game_data
+                .get_warp(warp_id)
+                .expect("Failed to find the warp!");
 
             let new_zone = Zone::load(&mut game_data.game_data, zone_id);
 
@@ -443,6 +370,40 @@ impl ZoneConnection {
                 y: object.transform.translation[1],
                 z: object.transform.translation[2],
             });
+
+            territory_type = zone_id;
+        }
+
+        self.change_zone(territory_type as u16).await;
+    }
+
+    pub async fn warp_aetheryte(&mut self, aetheryte_id: u32) {
+        tracing::info!("Warping to aetheryte {}", aetheryte_id);
+
+        let territory_type;
+        // find the pop range on the other side
+        {
+            let mut game_data = self.gamedata.lock().unwrap();
+            let (pop_range_id, zone_id) = game_data
+                .get_aetheryte(aetheryte_id)
+                .expect("Failed to find the aetheryte!");
+
+            let new_zone = Zone::load(&mut game_data.game_data, zone_id);
+
+            // find it on the other side
+            if let Some((object, _)) = new_zone.find_pop_range(pop_range_id) {
+                // set the exit position
+                self.exit_position = Some(Position {
+                    x: object.transform.translation[0],
+                    y: object.transform.translation[1],
+                    z: object.transform.translation[2],
+                });
+            } else {
+                tracing::warn!(
+                    "Failed to find pop range in {}. Falling back to 0,0,0!",
+                    new_zone.id
+                );
+            }
 
             territory_type = zone_id;
         }
@@ -606,6 +567,9 @@ impl ZoneConnection {
                     self.player_data.classjob_id = *classjob_id;
                     self.update_class_info().await;
                 }
+                Task::WarpAetheryte { aetheryte_id } => {
+                    self.warp_aetheryte(*aetheryte_id).await;
+                }
             }
         }
         player.queued_tasks.clear();
@@ -655,6 +619,8 @@ impl ZoneConnection {
     }
 
     pub async fn begin_log_out(&mut self) {
+        self.gracefully_logged_out = true;
+
         // write the player back to the database
         self.database.commit_player_data(&self.player_data);
 
@@ -754,6 +720,45 @@ impl ZoneConnection {
         .await;
     }
 
+    pub async fn actor_control(&mut self, actor_id: u32, actor_control: ActorControl) {
+        let ipc = ServerZoneIpcSegment {
+            op_code: ServerZoneIpcType::ActorControl,
+            timestamp: timestamp_secs(),
+            data: ServerZoneIpcData::ActorControl(actor_control),
+            ..Default::default()
+        };
+
+        self.send_segment(PacketSegment {
+            source_actor: actor_id,
+            target_actor: self.player_data.actor_id,
+            segment_type: SegmentType::Ipc,
+            data: SegmentData::Ipc { data: ipc },
+        })
+        .await;
+    }
+
+    pub async fn actor_control_target(&mut self, actor_id: u32, actor_control: ActorControlTarget) {
+        tracing::info!(
+            "we are sending actor control target to {actor_id}: {actor_control:#?} and WE ARE {:#?}",
+            self.player_data.actor_id
+        );
+
+        let ipc = ServerZoneIpcSegment {
+            op_code: ServerZoneIpcType::ActorControlTarget,
+            timestamp: timestamp_secs(),
+            data: ServerZoneIpcData::ActorControlTarget(actor_control),
+            ..Default::default()
+        };
+
+        self.send_segment(PacketSegment {
+            source_actor: actor_id,
+            target_actor: self.player_data.actor_id,
+            segment_type: SegmentType::Ipc,
+            data: SegmentData::Ipc { data: ipc },
+        })
+        .await;
+    }
+
     pub fn get_player_common_spawn(
         &self,
         exit_position: Option<Position>,
@@ -780,6 +785,7 @@ impl ZoneConnection {
             models: inventory.get_model_ids(&mut game_data),
             pos: exit_position.unwrap_or_default(),
             rotation: exit_rotation.unwrap_or(0.0),
+            voice: chara_details.chara_make.voice_id as u8,
             ..Default::default()
         }
     }
@@ -789,8 +795,9 @@ impl ZoneConnection {
         {
             let mut game_data = self.gamedata.lock().unwrap();
 
-            attributes =
-                game_data.get_racial_base_attributes(chara_details.chara_make.customize.subrace);
+            attributes = game_data
+                .get_racial_base_attributes(chara_details.chara_make.customize.subrace)
+                .expect("Failed to read racial attributes");
         }
 
         let ipc = ServerZoneIpcSegment {
@@ -811,6 +818,26 @@ impl ZoneConnection {
 
         self.send_segment(PacketSegment {
             source_actor: self.player_data.actor_id,
+            target_actor: self.player_data.actor_id,
+            segment_type: SegmentType::Ipc,
+            data: SegmentData::Ipc { data: ipc },
+        })
+        .await;
+    }
+
+    pub async fn send_npc(&mut self, mut npc: NpcSpawn) {
+        // the one from the global state is useless, of course
+        npc.common.spawn_index = self.get_free_spawn_index();
+
+        let ipc = ServerZoneIpcSegment {
+            op_code: ServerZoneIpcType::NpcSpawn,
+            timestamp: timestamp_secs(),
+            data: ServerZoneIpcData::NpcSpawn(npc),
+            ..Default::default()
+        };
+
+        self.send_segment(PacketSegment {
+            source_actor: 0x106ad804,
             target_actor: self.player_data.actor_id,
             segment_type: SegmentType::Ipc,
             data: SegmentData::Ipc { data: ipc },

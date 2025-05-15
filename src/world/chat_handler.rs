@@ -1,5 +1,5 @@
 use crate::{
-    common::{CustomizeData, ObjectId, ObjectTypeId, timestamp_secs},
+    common::{timestamp_secs, CustomizeData, ObjectId, ObjectTypeId, Position},
     inventory::Storage,
     ipc::zone::{
         ActorControl, ActorControlCategory, ActorControlSelf, BattleNpcSubKind, ChatMessage,
@@ -104,9 +104,21 @@ impl ChatHandler {
                     .await;
             }
             "!spawnmonster" => {
+                let parts: Vec<&str> = chat_message.message.split(' ').collect();
+                let bnpc_id: u32;
+                let model_id: u16;
+                let pos: Position = lua_player.player_data.position;
+
+                if parts.len() == 3 {
+                    bnpc_id = parts[1].parse::<u32>().unwrap();
+                    model_id = parts[2].parse::<u16>().unwrap();
+                } else {
+                    bnpc_id = 13498;
+                    model_id = 297;
+                }
                 connection
                     .handle
-                    .send(ToServer::DebugNewNpc(connection.id))
+                    .send(ToServer::DebugNewNpc(connection.id, bnpc_id, model_id, pos))
                     .await;
             }
             "!playscene" => {

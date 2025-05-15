@@ -88,7 +88,7 @@ pub enum ToServer {
     Disconnected(ClientId),
     /// A fatal error occured.
     FatalError(std::io::Error),
-    DebugNewNpc(ClientId),
+    DebugNewNpc(ClientId, u32, u16, Position),
 }
 
 #[derive(Clone, Debug)]

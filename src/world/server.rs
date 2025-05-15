@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc::Receiver;
 
 use crate::{
-    common::{ObjectId, Position},
+    common::{ObjectId},
     ipc::zone::{
         ActorControl, ActorControlCategory, ActorControlSelf, ActorControlTarget, BattleNpcSubKind,
         ClientTriggerCommand, CommonSpawn, NpcSpawn, ObjectKind,
@@ -279,9 +279,11 @@ pub async fn server_main_loop(mut recv: Receiver<ToServer>) -> Result<(), std::i
                     }
                 }
             }
-            ToServer::DebugNewNpc(_from_id) => {
+            ToServer::DebugNewNpc(_from_id, bnpc_id, model_id, pos) => {
                 for (id, (handle, _)) in &mut data.clients {
                     let id = *id;
+                    
+                    
 
                     let msg = FromServer::SpawnNPC(NpcSpawn {
                         aggression_mode: 1,
@@ -291,13 +293,13 @@ pub async fn server_main_loop(mut recv: Receiver<ToServer>) -> Result<(), std::i
                             mp_curr: 100,
                             mp_max: 100,
                             spawn_index: 0,   // not needed at this level
-                            bnpc_base: 13498, // TODO: changing this prevents it from spawning...
+                            bnpc_base: bnpc_id, // TODO: changing this prevents it from spawning...
                             bnpc_name: 405,
                             object_kind: ObjectKind::BattleNpc(BattleNpcSubKind::Enemy),
                             level: 1,
                             battalion: 4,
-                            model_chara: 297,
-                            pos: Position::default(),
+                            model_chara: model_id,
+                            pos: pos,
                             ..Default::default()
                         },
                         ..Default::default()

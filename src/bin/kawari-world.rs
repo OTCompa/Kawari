@@ -867,7 +867,7 @@ async fn client_loop(
                                     }
                                     SegmentData::KawariIpc { data } => handle_custom_ipc(&mut connection, data).await,
                                     _ => {
-                                        panic!("The server is recieving a response or unknown packet!")
+                                        tracing::info!("The server is recieving a response or unknown packet!")
                                     }
                                 }
                             }

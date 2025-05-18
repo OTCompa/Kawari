@@ -73,6 +73,14 @@ pub enum ActorControlCategory {
     Speed {
         #[brw(pad_before = 2)] //padding
         speed: u16,
+    },
+    #[brw(magic = 0x386u16)]
+    SetFestival {
+        #[brw(pad_before = 2)]
+        festival1: u16,
+        festival2: u16,
+        festival3: u16,
+        festival4: u16,
     }
 }
 

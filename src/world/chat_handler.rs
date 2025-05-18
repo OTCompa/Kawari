@@ -253,6 +253,13 @@ impl ChatHandler {
 
                 connection.send_inventory(true).await;
             }
+            "!speed" => {
+                let (_, speed) = chat_message.message.split_once(' ').unwrap();
+                let speed_as_int = speed.parse::<u16>().unwrap();
+                connection.actor_control_self(ActorControlSelf {
+                    category: ActorControlCategory::Speed { speed: speed_as_int }
+                }).await;
+            }
             _ => {}
         }
     }

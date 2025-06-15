@@ -16,3 +16,4 @@ backups/
 *.exp
 diff.json
 temp.zip
+patches/

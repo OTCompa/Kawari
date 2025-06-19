@@ -80,6 +80,32 @@ impl ChatHandler {
 
                 connection.send_inventory(true).await;
             }
+            "!festival" => {
+                // this only sets the festival for the player that called this command
+                let msg_parts: Vec<&str> = chat_message.message.split(' ').collect();
+                let mut festival1: u32 = 0;
+                let mut festival2: u32 = 0;
+                let mut festival3: u32 = 0;
+                let mut festival4: u32 = 0;
+
+                if msg_parts.len() > 1 {
+                    festival1 = msg_parts[1].parse::<u32>().unwrap();
+                } 
+                if msg_parts.len() > 2 {
+                    festival2 = msg_parts[2].parse::<u32>().unwrap();
+                }
+                if msg_parts.len() > 3 {
+                    festival3 = msg_parts[3].parse::<u32>().unwrap();
+                }
+                if msg_parts.len() > 4 {
+                    festival4 = msg_parts[4].parse::<u32>().unwrap();
+                }
+
+                connection.actor_control_self(ActorControlSelf {
+                    category: ActorControlCategory::SetFestival { festival1, festival2, festival3, festival4 }
+                }).await;
+
+            }
             _ => {}
         }
     }

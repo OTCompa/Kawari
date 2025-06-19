@@ -69,6 +69,14 @@ pub enum ActorControlCategory {
         insufficient_gil: u32,
         aetheryte_id: u32,
     },
+    #[brw(magic = 0x386u16)]
+    SetFestival {
+        #[brw(pad_before = 2)]
+        festival1: u32,
+        festival2: u32,
+        festival3: u32,
+        festival4: u32,
+    }
 }
 
 #[binrw]

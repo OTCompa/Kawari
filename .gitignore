@@ -9,3 +9,12 @@ src/opcodes.rs
 backups/
 temp.zip
 patches/
+
+*.bat
+*.exe
+*.lnk
+*.dll
+*.pdb
+*.lib
+*.exp
+diff.json
